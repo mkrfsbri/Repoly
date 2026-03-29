@@ -152,10 +152,21 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    let close = bar.close.to_string().parse::<f64>().unwrap_or(0.0);
-                    let high = bar.high.to_string().parse::<f64>().unwrap_or(0.0);
-                    let low = bar.low.to_string().parse::<f64>().unwrap_or(0.0);
-                    let vol = bar.volume.to_string().parse::<f64>().unwrap_or(0.0);
+                    // Convert Decimal → f64. Skip bar entirely if any price is
+                    // non-finite or zero — feeding 0.0 to indicators corrupts their state.
+                    let (close, high, low, vol) = {
+                        let parse = |d: &rust_decimal::Decimal| -> Option<f64> {
+                            let v: f64 = d.to_string().parse().ok()?;
+                            if v.is_finite() && v > 0.0 { Some(v) } else { None }
+                        };
+                        match (parse(&bar.close), parse(&bar.high), parse(&bar.low), parse(&bar.volume)) {
+                            (Some(c), Some(h), Some(l), Some(v)) => (c, h, l, v),
+                            _ => {
+                                warn!(key = %key, close = %bar.close, "Invalid bar prices, skipping");
+                                continue;
+                            }
+                        }
+                    };
 
                     // Update indicators
                     let (score, macd_sig) = {

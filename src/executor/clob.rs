@@ -255,20 +255,59 @@ impl ClobClient {
 
         tokio::spawn(async move {
             sleep(timeout).await;
-            // Check if still live; if so, cancel
-            let path = format!("/order/{cancel_order_id}");
-            let headers = match auth.l2_headers("DELETE", &path, "") {
+
+            // First, check order status — only cancel if still Live (not Filled).
+            let get_path = format!("/order/{cancel_order_id}");
+            let get_headers = match auth.l2_headers("GET", &get_path, "") {
                 Ok(h) => h,
-                Err(_) => return,
+                Err(e) => {
+                    warn!("Auto-cancel: failed to build GET headers: {e}");
+                    return;
+                }
             };
-            let url = format!("{base}{path}");
-            let mut rb = client.delete(&url);
-            for (k, v) in &headers {
-                rb = rb.header(k.as_str(), v.as_str());
+            let get_url = format!("{base}{get_path}");
+            let mut get_rb = client.get(&get_url);
+            for (k, v) in &get_headers {
+                get_rb = get_rb.header(k.as_str(), v.as_str());
             }
-            if let Ok(r) = rb.timeout(Duration::from_secs(tout_secs)).send().await {
+            let status_resp = match get_rb.timeout(Duration::from_secs(tout_secs)).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Auto-cancel: GET order failed: {e}");
+                    return;
+                }
+            };
+            let order_info: OrderResponse = match status_resp.json().await {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!("Auto-cancel: could not parse order status: {e}");
+                    return;
+                }
+            };
+
+            // Only cancel orders that are still live (not already filled or cancelled)
+            if order_info.status != OrderStatus::Live {
+                return;
+            }
+
+            let del_path = format!("/order/{cancel_order_id}");
+            let del_headers = match auth.l2_headers("DELETE", &del_path, "") {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!("Auto-cancel: failed to build DELETE headers: {e}");
+                    return;
+                }
+            };
+            let del_url = format!("{base}{del_path}");
+            let mut del_rb = client.delete(&del_url);
+            for (k, v) in &del_headers {
+                del_rb = del_rb.header(k.as_str(), v.as_str());
+            }
+            if let Ok(r) = del_rb.timeout(Duration::from_secs(tout_secs)).send().await {
                 if r.status().is_success() {
                     warn!("Auto-cancelled unfilled order: {cancel_order_id}");
+                } else {
+                    warn!("Auto-cancel DELETE failed ({}): {cancel_order_id}", r.status());
                 }
             }
         });

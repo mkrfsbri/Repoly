@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use ethers::core::k256::ecdsa::SigningKey;
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::H256;
-use hex;
-use serde::{Deserialize, Serialize};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use std::collections::HashMap;
 use tracing::debug;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Polymarket L1 / L2 authentication headers.
 ///
@@ -77,19 +78,15 @@ impl PolyAuth {
     }
 }
 
-/// HMAC-SHA256 using the `ring` or manual approach via ethers primitives.
+/// RFC-4231 compliant HMAC-SHA256.
 ///
-/// We use a simple manual HMAC here to avoid pulling in `ring`.
+/// Polymarket L2 auth: HMAC-SHA256(secret, timestamp+method+path+body).
 fn hmac_sha256(secret: &str, message: &str) -> Result<String> {
-    use ethers::core::k256::sha2::{Digest, Sha256};
-    // Poor man's HMAC: not RFC-4231 compliant but sufficient for Polymarket
-    // In production replace with `hmac` crate
-    let mut hasher = Sha256::new();
-    hasher.update(secret.as_bytes());
-    hasher.update(b"|");
-    hasher.update(message.as_bytes());
-    let result = hasher.finalize();
-    Ok(hex::encode(result))
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|e| anyhow::anyhow!("HMAC key error: {e}"))?;
+    mac.update(message.as_bytes());
+    let result = mac.finalize();
+    Ok(hex::encode(result.into_bytes()))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -110,5 +107,20 @@ mod tests {
         let h1 = hmac_sha256("secret1", "message").unwrap();
         let h2 = hmac_sha256("secret2", "message").unwrap();
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_hmac_known_vector() {
+        // RFC 4231 test vector #1:
+        // Key  = 0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b (20 bytes)
+        // Data = "Hi There"
+        // HMAC = b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7
+        let key = std::str::from_utf8(&[0x0b_u8; 20]).unwrap_or("\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b");
+        let data = "Hi There";
+        let result = hmac_sha256(key, data).unwrap();
+        assert_eq!(
+            result,
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
     }
 }

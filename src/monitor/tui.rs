@@ -346,11 +346,16 @@ impl Default for TuiApp {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn bar_chart(value: f64, max: f64, width: usize) -> String {
-    let filled = ((value / max) * width as f64) as usize;
-    let empty = width - filled.min(width);
+    // Guard against NaN, Infinity, or zero/negative max to prevent UB in cast.
+    if !value.is_finite() || !max.is_finite() || max < 1e-12 || width == 0 {
+        return format!("[{}]", "░".repeat(width));
+    }
+    let ratio = (value / max).clamp(0.0, 1.0);
+    let filled = (ratio * width as f64) as usize; // safe: ratio in [0,1]
+    let empty = width - filled;
     format!(
         "[{}{}]",
-        "█".repeat(filled.min(width)),
+        "█".repeat(filled),
         "░".repeat(empty)
     )
 }

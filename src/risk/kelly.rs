@@ -80,18 +80,23 @@ impl KellySizer {
         let wins: usize = self.win_log.iter().filter(|&&w| w).count();
         let p = wins as f64 / self.win_log.len() as f64;
 
-        let (win_sum, win_count, loss_sum, loss_count) = self.pnl_log.iter().fold(
-            (0.0_f64, 0_usize, 0.0_f64, 0_usize),
-            |(ws, wc, ls, lc), &pnl| {
-                if pnl >= 0.0 {
-                    (ws + pnl, wc + 1, ls, lc)
-                } else {
-                    (ws, wc, ls + pnl.abs(), lc + 1)
-                }
-            },
-        );
+        // Use the `won` boolean (not pnl sign) to categorise each trade.
+        // This prevents divergence when a trade is recorded as won=true but
+        // pnl is slightly negative (e.g. due to fees), or vice versa.
+        let (win_sum, win_count, loss_sum, loss_count) = self.win_log.iter()
+            .zip(self.pnl_log.iter())
+            .fold(
+                (0.0_f64, 0_usize, 0.0_f64, 0_usize),
+                |(ws, wc, ls, lc), (&won, &pnl)| {
+                    if won {
+                        (ws + pnl.max(0.0), wc + 1, ls, lc)
+                    } else {
+                        (ws, wc, ls + pnl.abs(), lc + 1)
+                    }
+                },
+            );
 
-        let avg_win = if win_count > 0 { win_sum / win_count as f64 } else { 1.0 };
+        let avg_win  = if win_count  > 0 { win_sum  / win_count  as f64 } else { 1.0 };
         let avg_loss = if loss_count > 0 { loss_sum / loss_count as f64 } else { 1.0 };
 
         let b = if avg_loss > 0.0 { avg_win / avg_loss } else { 1.0 };

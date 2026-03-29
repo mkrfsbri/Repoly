@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ethers::contract::abigen;
 use ethers::providers::{Provider, Ws};
-use ethers::types::Address;
+use ethers::types::{Address, U256};
 use rust_decimal::Decimal;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -84,9 +84,16 @@ impl BalanceTracker {
         let balance = if raw.is_zero() {
             Decimal::ZERO
         } else {
-            // Use low 64 bits — USDC balances are safely < u64::MAX
-            let raw_u64 = raw.low_u64();
-            Decimal::from(raw_u64) / Decimal::from(divisor)
+            // Guard against U256 values exceeding u64::MAX before calling low_u64().
+            // u64::MAX USDC = ~18.4 billion USDC — far beyond any realistic balance,
+            // but we check rather than silently truncate.
+            let max_u64 = U256::from(u64::MAX);
+            if raw > max_u64 {
+                warn!("USDC balance ({raw}) exceeds u64::MAX — capping to u64::MAX");
+                Decimal::from(u64::MAX) / Decimal::from(divisor)
+            } else {
+                Decimal::from(raw.low_u64()) / Decimal::from(divisor)
+            }
         };
 
         debug!("On-chain balance: {balance} USDC");

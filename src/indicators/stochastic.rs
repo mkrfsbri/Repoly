@@ -89,14 +89,17 @@ impl StochState {
         Some((smooth_k_val, d_val))
     }
 
-    /// True if %K just crossed above %D from below in oversold zone (< 20).
+    /// True if %K just crossed above %D from below, and the crossover originated
+    /// in the oversold zone (prev_k < 20). Using prev_k — not current k — because
+    /// by the time the cross completes, %K may already have risen above 20.
     pub fn is_long_trigger(&self) -> bool {
-        self.initialized && self.prev_k < self.prev_d && self.k > self.d && self.k < 20.0
+        self.initialized && self.prev_k < self.prev_d && self.k > self.d && self.prev_k < 20.0
     }
 
-    /// True if %K just crossed below %D from above in overbought zone (> 80).
+    /// True if %K just crossed below %D from above, and the crossover originated
+    /// in the overbought zone (prev_k > 80).
     pub fn is_short_trigger(&self) -> bool {
-        self.initialized && self.prev_k > self.prev_d && self.k < self.d && self.k > 80.0
+        self.initialized && self.prev_k > self.prev_d && self.k < self.d && self.prev_k > 80.0
     }
 
     /// Score: +1.5 (long trigger), -1.5 (short trigger), 0 otherwise.

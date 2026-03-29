@@ -81,6 +81,9 @@ pub struct BacktestParams {
     pub atr_max_pct: f64,
     pub confluence_threshold: f64,
     pub kelly_fraction: f64,
+    /// Minimum bars between consecutive entry signals (was incorrectly using
+    /// confluence_threshold as a bar count, which is a type confusion bug).
+    pub cooldown_bars: usize,
 }
 
 impl Default for BacktestParams {
@@ -91,6 +94,7 @@ impl Default for BacktestParams {
             atr_max_pct: 0.80,
             confluence_threshold: 3.5,
             kelly_fraction: 0.50,
+            cooldown_bars: 2,
         }
     }
 }
@@ -221,7 +225,9 @@ impl BacktestEngine {
                         close,
                         position_size,
                     );
-                    balance += pnl;
+                    // Return deployed capital AND net profit/loss.
+                    // (balance -= size was recorded at entry; we must add it back.)
+                    balance += position_size + pnl;
                     kelly.record_trade(won, pnl);
 
                     let dd = (peak_balance - balance) / peak_balance;
@@ -250,8 +256,8 @@ impl BacktestEngine {
                 continue;
             }
 
-            // Cooldown between signals
-            if i - last_signal_bar < params.confluence_threshold as usize {
+            // Cooldown between signals (use dedicated bar count, NOT the score threshold)
+            if i - last_signal_bar < params.cooldown_bars {
                 continue;
             }
 
@@ -434,6 +440,7 @@ impl GridSearch {
                                 atr_max_pct: atr_max,
                                 confluence_threshold: thresh,
                                 kelly_fraction: kelly,
+                                cooldown_bars: 2,
                             });
                         }
                     }

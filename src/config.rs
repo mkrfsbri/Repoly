@@ -3,6 +3,14 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::str::FromStr;
 
+/// Parse an f64 config value to Decimal without losing precision via an
+/// uncontrolled to_string() call (which can produce "10.000000000000002" etc.).
+fn f64_to_decimal(v: f64) -> Result<Decimal> {
+    // Six decimal places is sufficient for USDC amounts; avoids f64 noise.
+    Decimal::from_str(&format!("{v:.6}"))
+        .map_err(|e| anyhow::anyhow!("Cannot convert {v} to Decimal: {e}"))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub bot: BotConfig,
@@ -56,8 +64,10 @@ pub struct ClobConfig {
 }
 
 impl ClobConfig {
-    pub fn tick_size_decimal(&self) -> Decimal {
-        Decimal::from_str(&self.tick_size).unwrap_or(Decimal::new(1, 2))
+    /// Parse tick_size string → Decimal. Errors surface at startup via Config::validate().
+    pub fn tick_size_decimal(&self) -> Result<Decimal> {
+        Decimal::from_str(&self.tick_size)
+            .map_err(|e| anyhow::anyhow!("Invalid clob.tick_size '{}': {e}", self.tick_size))
     }
 }
 
@@ -73,12 +83,14 @@ pub struct RiskConfig {
 }
 
 impl RiskConfig {
-    pub fn min_bet(&self) -> Decimal {
-        Decimal::from_str(&self.min_bet_usdc.to_string()).unwrap_or(Decimal::new(10, 0))
+    pub fn min_bet(&self) -> Result<Decimal> {
+        f64_to_decimal(self.min_bet_usdc)
+            .with_context(|| format!("Invalid risk.min_bet_usdc: {}", self.min_bet_usdc))
     }
 
-    pub fn max_bet(&self) -> Decimal {
-        Decimal::from_str(&self.max_bet_usdc.to_string()).unwrap_or(Decimal::new(200, 0))
+    pub fn max_bet(&self) -> Result<Decimal> {
+        f64_to_decimal(self.max_bet_usdc)
+            .with_context(|| format!("Invalid risk.max_bet_usdc: {}", self.max_bet_usdc))
     }
 }
 
@@ -115,6 +127,42 @@ impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {path}"))?;
-        toml::from_str(&content).with_context(|| "Failed to parse config.toml")
+        let cfg: Self =
+            toml::from_str(&content).with_context(|| "Failed to parse config.toml")?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Validate all fields that require non-trivial parsing or range checks.
+    /// Called at startup — fail fast rather than hitting silent fallbacks at runtime.
+    pub fn validate(&self) -> Result<()> {
+        self.clob.tick_size_decimal()
+            .context("clob.tick_size is invalid")?;
+        self.risk.min_bet()
+            .context("risk.min_bet_usdc is invalid")?;
+        self.risk.max_bet()
+            .context("risk.max_bet_usdc is invalid")?;
+
+        anyhow::ensure!(
+            self.risk.min_bet_usdc > 0.0,
+            "risk.min_bet_usdc must be > 0"
+        );
+        anyhow::ensure!(
+            self.risk.max_bet_usdc >= self.risk.min_bet_usdc,
+            "risk.max_bet_usdc must be >= min_bet_usdc"
+        );
+        anyhow::ensure!(
+            self.risk.kelly_fraction > 0.0 && self.risk.kelly_fraction <= 1.0,
+            "risk.kelly_fraction must be in (0, 1]"
+        );
+        anyhow::ensure!(
+            self.circuit_breaker.max_drawdown > 0.0 && self.circuit_breaker.max_drawdown < 1.0,
+            "circuit_breaker.max_drawdown must be in (0, 1)"
+        );
+        anyhow::ensure!(
+            self.volatility.atr_min_pct < self.volatility.atr_max_pct,
+            "volatility.atr_min_pct must be < atr_max_pct"
+        );
+        Ok(())
     }
 }

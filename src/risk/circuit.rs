@@ -42,7 +42,8 @@ impl CircuitBreaker {
 
     /// Check balance-based conditions. Called after each balance refresh.
     pub fn check_balance(&self, current: Decimal) -> bool {
-        if self.is_open.load(Ordering::Relaxed) {
+        // Acquire: see all stores that happened-before the trip() SeqCst store.
+        if self.is_open.load(Ordering::Acquire) {
             return false;
         }
         let peak = *self.peak_balance.read();
@@ -95,7 +96,9 @@ impl CircuitBreaker {
 
     /// True if trading is allowed.
     pub fn is_ok(&self) -> bool {
-        !self.is_open.load(Ordering::SeqCst)
+        // Acquire matches the SeqCst Release in trip(), ensuring we never see
+        // a stale false-OK state after a trip.
+        !self.is_open.load(Ordering::Acquire)
     }
 
     /// Manually reset (e.g. after cooldown period or operator override).

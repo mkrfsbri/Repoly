@@ -8,7 +8,10 @@ pub struct ObvState {
     pub value: f64,
     pub prev_close: f64,
     rolling_window: usize,
-    deltas: VecDeque<f64>, // rolling OBV deltas for average
+    /// Stores the **signed** delta each bar (positive = price up, negative = price down).
+    /// Used to determine OBV direction in confirms_move.
+    deltas: VecDeque<f64>,
+    /// Rolling average of |delta| — used as a threshold to filter noise.
     pub rolling_avg: f64,
     pub initialized: bool,
 }
@@ -28,7 +31,6 @@ impl ObvState {
     /// Feed (close, volume). Returns current OBV after update.
     pub fn update(&mut self, close: f64, volume: f64) -> f64 {
         let delta = if !self.initialized {
-            // First bar — just record close, no delta yet
             self.prev_close = close;
             self.initialized = true;
             0.0
@@ -43,37 +45,44 @@ impl ObvState {
         self.value += delta;
         self.prev_close = close;
 
-        // Maintain rolling average of |delta|
-        self.deltas.push_back(delta.abs());
+        // Store the signed delta; rolling_avg tracks magnitude only.
+        self.deltas.push_back(delta);
         if self.deltas.len() > self.rolling_window {
             self.deltas.pop_front();
         }
         self.rolling_avg = if self.deltas.is_empty() {
             0.0
         } else {
-            self.deltas.iter().sum::<f64>() / self.deltas.len() as f64
+            self.deltas.iter().map(|d| d.abs()).sum::<f64>() / self.deltas.len() as f64
         };
 
         self.value
     }
 
-    /// True if volume confirms price direction.
+    /// True if the last OBV delta confirms the expected price direction.
     ///
-    /// `price_dir`: +1 for up, -1 for down.
-    /// Requires the last OBV delta to align with direction AND be above 0.3% of rolling avg.
+    /// `price_dir`: +1 for bullish, -1 for bearish.
+    ///
+    /// Uses the actual signed delta — NOT the absolute value — so direction is
+    /// preserved. Also requires the move to be above 0.3% of the rolling average
+    /// to filter out noise.
     pub fn confirms_move(&self, price_dir: i8) -> bool {
-        let last_delta = self.deltas.back().copied().unwrap_or(0.0);
-        let raw_last = if self.prev_close > 0.0 { last_delta } else { 0.0 };
+        let last_delta = match self.deltas.back() {
+            Some(&d) => d,
+            None => return false,
+        };
 
-        // Get actual signed delta from value
-        let signed_delta = match price_dir {
-            1 => raw_last,
-            -1 => -raw_last,
+        // Direction must match
+        let dir_matches = match price_dir {
+            1 => last_delta > 0.0,
+            -1 => last_delta < 0.0,
             _ => return false,
         };
 
-        let above_threshold = last_delta > self.rolling_avg * 0.003;
-        signed_delta > 0.0 && above_threshold
+        // Magnitude must be meaningful (above 0.3% of rolling average)
+        let above_threshold = last_delta.abs() > self.rolling_avg * 0.003;
+
+        dir_matches && above_threshold
     }
 
     /// Score: +1 (confirms bullish), -1 (confirms bearish), 0 (no confirmation).
@@ -118,5 +127,28 @@ mod tests {
         obv.update(100.0, 1000.0);
         obv.update(100.0, 500.0); // price flat → OBV unchanged
         assert_eq!(obv.value, 0.0);
+    }
+
+    #[test]
+    fn test_confirms_move_bullish() {
+        let mut obv = ObvState::new(5);
+        for _ in 0..5 {
+            obv.update(100.0, 1000.0); // seed rolling avg
+            obv.update(101.0, 1000.0);
+        }
+        // Last delta was positive (price went up)
+        assert!(obv.confirms_move(1), "Should confirm bullish move");
+        assert!(!obv.confirms_move(-1), "Should NOT confirm bearish when last delta > 0");
+    }
+
+    #[test]
+    fn test_confirms_move_bearish() {
+        let mut obv = ObvState::new(5);
+        for _ in 0..5 {
+            obv.update(100.0, 1000.0);
+            obv.update(99.0, 1000.0); // seed with down moves
+        }
+        assert!(obv.confirms_move(-1), "Should confirm bearish move");
+        assert!(!obv.confirms_move(1), "Should NOT confirm bullish when last delta < 0");
     }
 }

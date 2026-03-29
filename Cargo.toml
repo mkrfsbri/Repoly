@@ -59,6 +59,10 @@ toml = "0.8"
 # Hex encoding for signing
 hex = "0.4"
 
+# Proper HMAC-SHA256 for Polymarket L2 auth
+hmac = "0.12"
+sha2 = "0.10"
+
 # Thread-safe RwLock with better performance than std
 parking_lot = "0.12"
 
