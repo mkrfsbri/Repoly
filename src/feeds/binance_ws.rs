@@ -227,8 +227,11 @@ impl BinanceFeed {
     }
 
     async fn connect_and_stream(&self) -> Result<()> {
+        // ws_url already contains the /stream path (e.g. "wss://stream.binance.com/stream").
+        // Binance combined-stream format: <base>/stream?streams=s1/s2/...
+        // Do NOT append "/stream" again — that would produce /stream/stream.
         let stream_param = self.streams.join("/");
-        let url = format!("{}/stream?streams={}", self.ws_url, stream_param);
+        let url = format!("{}?streams={}", self.ws_url, stream_param);
         info!("Connecting to Binance WS: {url}");
 
         let (ws_stream, _) = connect_async(&url).await?;
