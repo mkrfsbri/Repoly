@@ -76,6 +76,11 @@ impl PolyAuth {
     pub fn address(&self) -> ethers::types::Address {
         self.wallet.address()
     }
+
+    /// Return a clone of the inner `LocalWallet` for use with on-chain signers.
+    pub fn local_wallet(&self) -> Result<LocalWallet> {
+        Ok(self.wallet.clone())
+    }
 }
 
 /// RFC-4231 compliant HMAC-SHA256.

@@ -47,6 +47,14 @@ pub struct PositionDisplay {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct ClaimDisplay {
+    pub condition_id: String,
+    pub amount_usdc: Decimal,
+    pub tx_hash: String,
+    pub via_relayer: bool,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct DashboardState {
     pub markets: Vec<MarketDisplayState>,
     pub positions: Vec<PositionDisplay>,
@@ -58,6 +66,8 @@ pub struct DashboardState {
     pub today_losses: u32,
     pub circuit_open: bool,
     pub log_lines: Vec<String>,
+    pub recent_claims: Vec<ClaimDisplay>,
+    pub total_claimed_usdc: Decimal,
 }
 
 impl DashboardState {
@@ -87,6 +97,15 @@ impl DashboardState {
         self.log_lines.push(line);
         if self.log_lines.len() > 100 {
             self.log_lines.remove(0);
+        }
+    }
+
+    pub fn push_claim(&mut self, claim: ClaimDisplay) {
+        self.total_claimed_usdc += claim.amount_usdc;
+        self.recent_claims.push(claim);
+        // Keep last 20 claims in dashboard memory
+        if self.recent_claims.len() > 20 {
+            self.recent_claims.remove(0);
         }
     }
 }
@@ -270,6 +289,10 @@ impl TuiApp {
                 "  {}W {}L",
                 state.today_wins, state.today_losses
             )),
+            Span::styled(
+                format!("  |  Claimed: ${:.2}", state.total_claimed_usdc),
+                Style::default().fg(Color::Cyan),
+            ),
         ]);
 
         let block = Block::default()
@@ -319,20 +342,61 @@ impl TuiApp {
     }
 
     fn render_signal_log(f: &mut Frame, state: &DashboardState, area: Rect) {
-        let block = Block::default()
+        // Split into claims (top, ~30%) and signal log (bottom, ~70%)
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(area);
+
+        // ── Claims panel ──────────────────────────────────────────────────────
+        let claims_block = Block::default()
+            .title(" CLAIMS ")
+            .borders(Borders::ALL)
+            .style(Style::default().fg(Color::Cyan));
+
+        let claim_items: Vec<ListItem> = if state.recent_claims.is_empty() {
+            vec![ListItem::new(Span::raw("  No claims yet"))]
+        } else {
+            let visible = split[0].height.saturating_sub(2) as usize;
+            let start = state.recent_claims.len().saturating_sub(visible);
+            state.recent_claims[start..]
+                .iter()
+                .map(|c| {
+                    let method = if c.via_relayer { "relay" } else { "direct" };
+                    let short_cid = if c.condition_id.len() > 10 {
+                        &c.condition_id[..10]
+                    } else {
+                        c.condition_id.as_str()
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!("  +${:.2}  ", c.amount_usdc),
+                            Style::default().fg(Color::Green),
+                        ),
+                        Span::raw(format!("{short_cid}…  [{method}]")),
+                    ]))
+                })
+                .collect()
+        };
+
+        let claims_list = List::new(claim_items).block(claims_block);
+        f.render_widget(claims_list, split[0]);
+
+        // ── Signal log panel ──────────────────────────────────────────────────
+        let log_block = Block::default()
             .title(" SIGNAL LOG ")
             .borders(Borders::ALL)
             .style(Style::default().fg(Color::DarkGray));
 
-        let visible_lines = area.height.saturating_sub(2) as usize;
+        let visible_lines = split[1].height.saturating_sub(2) as usize;
         let start = state.log_lines.len().saturating_sub(visible_lines);
-        let items: Vec<ListItem> = state.log_lines[start..]
+        let log_items: Vec<ListItem> = state.log_lines[start..]
             .iter()
             .map(|l| ListItem::new(Span::raw(l.clone())))
             .collect();
 
-        let list = List::new(items).block(block);
-        f.render_widget(list, area);
+        let log_list = List::new(log_items).block(log_block);
+        f.render_widget(log_list, split[1]);
     }
 }
 

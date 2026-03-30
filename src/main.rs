@@ -9,6 +9,8 @@ mod signals;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use ethers::providers::{Provider, Ws};
+use executor::AutoClaimer;
 use feeds::binance_ws::{fetch_history, stream_key_from_stream, BinanceFeed, KlineBuffer};
 use feeds::gamma_api::GammaClient;
 use indicators::IndicatorBundle;
@@ -126,6 +128,49 @@ async fn main() -> Result<()> {
         cfg.telegram.chat_id.clone(),
         cfg.telegram.enabled,
     ));
+
+    // ── Auto-claim loop ───────────────────────────────────────────────────────
+    if cfg.claim.enabled {
+        match setup_auto_claimer(&cfg, auth.as_ref()).await {
+            Ok(claimer) => {
+                let claimer_task = claimer.clone();
+                let tg_claim = telegram.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(
+                            claimer_task.check_interval_secs,
+                        ))
+                        .await;
+                        match claimer_task.claim_cycle().await {
+                            Ok(results) => {
+                                for r in results {
+                                    info!(
+                                        condition_id = %r.condition_id,
+                                        amount_usdc = %r.amount_usdc,
+                                        tx = %r.tx_hash,
+                                        "Position claimed"
+                                    );
+                                    let _ = tg_claim
+                                        .send(monitor::telegram::AlertKind::Claim {
+                                            condition_id: r.condition_id,
+                                            amount_usdc: r.amount_usdc,
+                                            tx_hash: r.tx_hash,
+                                            via_relayer: r.via_relayer,
+                                        })
+                                        .await;
+                                }
+                            }
+                            Err(e) => warn!("Claim cycle error: {e}"),
+                        }
+                    }
+                });
+                info!("AutoClaimer task started");
+            }
+            Err(e) => {
+                warn!("AutoClaimer setup failed (claim loop disabled): {e}");
+            }
+        }
+    }
 
     // ── Main signal loop ──────────────────────────────────────────────────────
     let mut rx = feed.subscribe();
@@ -277,6 +322,45 @@ async fn main() -> Result<()> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Build an AutoClaimer from config + optional auth. Returns Err if auth is
+/// missing (required for signing redemption headers) or RPC connection fails.
+async fn setup_auto_claimer(
+    cfg: &config::Config,
+    auth: Option<&executor::signing::PolyAuth>,
+) -> Result<Arc<AutoClaimer>> {
+    let auth = auth
+        .cloned()
+        .context("AutoClaimer requires wallet credentials (POLY_API_KEY etc.)")?;
+
+    let wallet = auth
+        .local_wallet()
+        .context("AutoClaimer requires a local wallet for on-chain fallback")?;
+
+    let provider: Provider<Ws> = Provider::<Ws>::connect(&cfg.polygon.rpc_url)
+        .await
+        .context("AutoClaimer: failed to connect to Polygon RPC")?;
+    let provider = Arc::new(provider);
+
+    let claimer = Arc::new(
+        AutoClaimer::new(
+            cfg.clob.base_url.clone(),
+            &cfg.claim.ctf_address,
+            &cfg.polygon.usdc_address,
+            &cfg.claim.neg_risk_adapter,
+            provider,
+            wallet,
+            auth,
+            cfg.bot.dry_run,
+            cfg.claim.use_relayer,
+            cfg.claim.check_interval_secs,
+            cfg.claim.min_claimable_usdc,
+        )
+        .context("Failed to construct AutoClaimer")?,
+    );
+
+    Ok(claimer)
+}
 
 /// "btcusdt@kline_5m" → Some(("BTCUSDT", "5m"))
 fn parse_stream(stream: &str) -> Option<(String, String)> {
