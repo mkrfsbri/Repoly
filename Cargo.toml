@@ -1,0 +1,77 @@
+[package]
+name = "polymarket-signal-bot"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "polymarket-signal-bot"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json"] }
+
+# WebSocket
+tungstenite = "0.20"
+tokio-tungstenite = "0.20"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Decimal arithmetic — no f32/f64 in execution path
+rust_decimal = { version = "1", features = ["serde-float"] }
+rust_decimal_macros = "1"
+
+# Ethereum (EIP-712 signing, Polygon RPC)
+ethers = { version = "2", features = ["ws", "rustls"] }
+
+# TUI dashboard
+ratatui = "0.26"
+crossterm = "0.27"
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Parallel backtest grid search
+rayon = "1"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Time (VWAP session reset, expiry checks)
+chrono = { version = "0.4", features = ["serde"] }
+
+# Idempotency for order IDs
+uuid = { version = "1", features = ["v4"] }
+
+# Async stream combinators
+futures = "0.3"
+
+# Config file parsing
+toml = "0.8"
+
+# Hex encoding for signing
+hex = "0.4"
+
+# Proper HMAC-SHA256 for Polymarket L2 auth
+hmac = "0.12"
+sha2 = "0.10"
+
+# Thread-safe RwLock with better performance than std
+parking_lot = "0.12"
+
+# CSV parsing for backtest data loader (Binance Vision format)
+csv = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
