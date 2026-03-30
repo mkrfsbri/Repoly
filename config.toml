@@ -55,3 +55,11 @@ reentry_cooldown_bars = 5
 enabled = false
 # bot_token = "YOUR_BOT_TOKEN"
 # chat_id = "YOUR_CHAT_ID"
+
+[claim]
+enabled = true
+check_interval_secs = 300       # poll for resolved markets every 5 min
+min_claimable_usdc = 1.0        # skip tiny dust claims
+use_relayer = true              # gasless relayer first, direct contract as fallback
+ctf_address = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+neg_risk_adapter = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"

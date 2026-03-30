@@ -40,6 +40,12 @@ pub enum AlertKind {
         reason: String,
         score: f64,
     },
+    Claim {
+        condition_id: String,
+        amount_usdc: rust_decimal::Decimal,
+        tx_hash: String,
+        via_relayer: bool,
+    },
     Custom(String),
 }
 
@@ -78,6 +84,18 @@ impl AlertKind {
 
             AlertKind::Skipped { market, reason, score } => {
                 format!("⚠️  SKIPPED | {market} | {reason} | Score: {score:.1} blocked")
+            }
+
+            AlertKind::Claim { condition_id, amount_usdc, tx_hash, via_relayer } => {
+                let method = if *via_relayer { "relayer" } else { "direct" };
+                let short_cid = if condition_id.len() > 10 {
+                    &condition_id[..10]
+                } else {
+                    condition_id.as_str()
+                };
+                format!(
+                    "💰 CLAIM   | cond:{short_cid}… | +${amount_usdc} USDC | tx:{tx_hash} | via:{method}"
+                )
             }
 
             AlertKind::Custom(msg) => msg.clone(),

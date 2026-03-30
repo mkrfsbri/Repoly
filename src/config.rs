@@ -23,6 +23,7 @@ pub struct Config {
     pub volatility: VolatilityConfig,
     pub signal: SignalConfig,
     pub telegram: TelegramConfig,
+    pub claim: ClaimConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -121,6 +122,16 @@ pub struct TelegramConfig {
     pub enabled: bool,
     pub bot_token: Option<String>,
     pub chat_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClaimConfig {
+    pub enabled: bool,
+    pub check_interval_secs: u64,
+    pub min_claimable_usdc: f64,
+    pub use_relayer: bool,
+    pub ctf_address: String,
+    pub neg_risk_adapter: String,
 }
 
 impl Config {
