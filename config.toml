@@ -34,6 +34,7 @@ max_bet_usdc = 200.0
 kelly_fraction = 0.50       # half-Kelly
 kelly_window = 50           # rolling trade window
 cold_start_pct = 0.05       # flat 5% until kelly window fills
+initial_balance_usdc = 1000.0  # starting balance for kelly sizing / circuit breaker
 
 [circuit_breaker]
 max_drawdown = 0.15         # 15% from peak

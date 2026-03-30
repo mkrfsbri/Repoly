@@ -81,6 +81,7 @@ pub struct RiskConfig {
     pub kelly_fraction: f64,
     pub kelly_window: usize,
     pub cold_start_pct: f64,
+    pub initial_balance_usdc: f64,
 }
 
 impl RiskConfig {
@@ -92,6 +93,11 @@ impl RiskConfig {
     pub fn max_bet(&self) -> Result<Decimal> {
         f64_to_decimal(self.max_bet_usdc)
             .with_context(|| format!("Invalid risk.max_bet_usdc: {}", self.max_bet_usdc))
+    }
+
+    pub fn initial_balance(&self) -> Result<Decimal> {
+        f64_to_decimal(self.initial_balance_usdc)
+            .with_context(|| format!("Invalid risk.initial_balance_usdc: {}", self.initial_balance_usdc))
     }
 }
 

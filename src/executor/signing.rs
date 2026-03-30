@@ -22,6 +22,21 @@ pub struct PolyAuth {
 }
 
 impl PolyAuth {
+    /// Build a no-op auth instance for dry-run mode when credentials are absent.
+    /// The generated wallet address is deterministic but never holds real funds.
+    pub fn dummy() -> Self {
+        // Secp256k1 requires a non-zero scalar; "0x01…01" is the simplest valid key.
+        let wallet: LocalWallet = "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse()
+            .expect("static dummy key is always valid");
+        Self {
+            api_key: "dry-run".to_string(),
+            api_secret: "dry-run".to_string(),
+            api_passphrase: "dry-run".to_string(),
+            wallet,
+        }
+    }
+
     /// Load from environment variables.
     pub fn from_env() -> Result<Self> {
         let api_key = std::env::var("POLY_API_KEY").context("POLY_API_KEY not set")?;

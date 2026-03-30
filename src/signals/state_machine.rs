@@ -145,8 +145,12 @@ impl SignalMachine {
     }
 
     /// Call after successfully submitting an order.
+    /// No-ops silently if the state has already advanced past Triggered (e.g. the
+    /// next bar arrived before the async order response came back).
     pub fn mark_entered(&mut self) {
-        assert_eq!(self.state, SignalState::Triggered, "Invalid transition");
+        if self.state != SignalState::Triggered {
+            return;
+        }
         self.state = SignalState::Entered;
         self.bars_since_entry = 0;
         info!(pair = %self.pair, "ENTERED");

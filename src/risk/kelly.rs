@@ -125,6 +125,11 @@ impl KellySizer {
     pub fn is_warm(&self) -> bool {
         self.win_log.len() >= self.window / 2
     }
+
+    /// Current Kelly fraction used for sizing (cold-start flat or live estimate).
+    pub fn current_fraction(&self) -> f64 {
+        self.cached_fraction
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
