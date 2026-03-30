@@ -120,7 +120,10 @@ impl GammaClient {
     /// hits the exact markets we intend to trade.
     pub async fn refresh(&self) -> Result<usize> {
         let now = Utc::now();
-        let mut raw_candidates: Vec<GammaMarket> = Vec::new();
+        // Collect filtered PolyMarkets per-interval so each market carries the
+        // correct interval_secs tag.  We cannot determine this post-hoc because
+        // 15-min boundaries are also 5-min boundaries (900 % 300 == 0).
+        let mut all_markets: Vec<PolyMarket> = Vec::new();
 
         for &interval in &self.interval_secs {
             let target = cycle_target_expiry(interval, self.min_entry_secs, now);
@@ -145,17 +148,14 @@ impl GammaClient {
             );
 
             match self.fetch_raw(&url).await {
-                Ok(mut page) => {
+                Ok(page) => {
                     info!(
                         "Gamma cycle={}s expiry={}: {} raw markets returned",
                         interval,
                         target.format("%H:%M:%S"),
                         page.len()
                     );
-                    // Tag each entry with its cycle interval so we can attach it
-                    // to the PolyMarket after filtering.  We abuse a transient
-                    // workaround: store interval in a wrapper.
-                    raw_candidates.append(&mut page);
+                    all_markets.extend(self.filter_for_interval(page, now, interval));
                 }
                 Err(e) => {
                     warn!("Gamma cycle={}s query failed: {e}", interval);
@@ -163,7 +163,15 @@ impl GammaClient {
             }
         }
 
-        let filtered = self.filter(raw_candidates, now);
+        // Deduplicate by condition_id (a market can appear in both 5-min and
+        // 15-min queries when their boundaries coincide; keep the first, which
+        // has the lower/more-specific interval).
+        let mut seen = std::collections::HashSet::new();
+        let filtered: Vec<PolyMarket> = all_markets
+            .into_iter()
+            .filter(|m| seen.insert(m.condition_id.clone()))
+            .collect();
+
         let count = filtered.len();
         *self.markets.write().await = filtered;
 
@@ -216,7 +224,7 @@ impl GammaClient {
         Ok(resp.json::<Vec<GammaMarket>>().await?)
     }
 
-    fn filter(&self, raw: Vec<GammaMarket>, now: DateTime<Utc>) -> Vec<PolyMarket> {
+    fn filter_for_interval(&self, raw: Vec<GammaMarket>, now: DateTime<Utc>, interval: i64) -> Vec<PolyMarket> {
         let mut out = Vec::new();
         let mut rej_status  = 0usize;
         let mut rej_asset   = 0usize;
@@ -277,8 +285,10 @@ impl GammaClient {
                 continue;
             }
 
-            // Determine which configured cycle this expiry belongs to.
-            let interval_secs = best_interval(expiry, now, &self.interval_secs);
+            // Use the interval we queried with — do NOT try to infer it from
+            // the expiry timestamp because 15-min boundaries are also 5-min
+            // boundaries (900 % 300 == 0).
+            let interval_secs = interval;
 
             let current_price = m
                 .outcome_prices
@@ -341,17 +351,6 @@ pub fn cycle_target_expiry(
     };
 
     DateTime::from_timestamp(target_ts, 0).unwrap_or(now)
-}
-
-/// Find which configured interval best matches a market's expiry.
-fn best_interval(expiry: DateTime<Utc>, now: DateTime<Utc>, intervals: &[i64]) -> i64 {
-    let secs_left = (expiry - now).num_seconds().max(0);
-    // Pick the interval whose boundary is closest to the seconds remaining.
-    intervals
-        .iter()
-        .copied()
-        .min_by_key(|&iv| (secs_left % iv).min(iv - secs_left % iv))
-        .unwrap_or(300)
 }
 
 // ── Parsing helpers ───────────────────────────────────────────────────────────

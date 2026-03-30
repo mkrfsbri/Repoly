@@ -6,7 +6,7 @@ log_level = "info"          # trace | debug | info | warn | error
 ws_url = "wss://stream.binance.com/stream"
 rest_url = "https://api.binance.com"
 kline_buffer_size = 500
-streams = ["btcusdt@kline_1m", "btcusdt@kline_5m", "ethusdt@kline_5m", "ethusdt@kline_1m"]
+streams = ["btcusdt@kline_5m", "btcusdt@kline_15m", "ethusdt@kline_5m", "ethusdt@kline_15m"]
 
 [gamma]
 base_url = "https://gamma-api.polymarket.com"

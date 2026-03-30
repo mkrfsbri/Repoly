@@ -493,13 +493,19 @@ async fn main() -> Result<()> {
                         "🚀 SIGNAL TRIGGERED"
                     );
 
-                    // Find matching Gamma markets for this underlying.
+                    // Find matching Gamma markets for this underlying AND interval.
+                    // Both must match: a 5m Binance signal should only enter 5m
+                    // Polymarket markets, not 15m ones, and vice versa.
                     let underlying = stream_to_underlying(&key);
+                    let interval   = stream_to_interval(&key);
                     let matching: Vec<_> = gamma_loop
                         .active_markets()
                         .await
                         .into_iter()
-                        .filter(|m| underlying.as_ref() == Some(&m.underlying))
+                        .filter(|m| {
+                            underlying.as_ref() == Some(&m.underlying)
+                                && m.interval_secs == interval
+                        })
                         .collect();
 
                     if matching.is_empty() {
@@ -739,6 +745,18 @@ fn round_to_tick(price: Decimal, tick: Decimal) -> Decimal {
         return price;
     }
     (price / tick).round() * tick
+}
+
+/// Map a Binance stream key (e.g. "BTCUSDT_5m") to the cycle length in seconds.
+/// 5m → 300, 15m → 900; anything unrecognised → 0 (will never match a market).
+fn stream_to_interval(key: &str) -> i64 {
+    if key.ends_with("_5m") || key.ends_with("_5M") {
+        300
+    } else if key.ends_with("_15m") || key.ends_with("_15M") {
+        900
+    } else {
+        0
+    }
 }
 
 /// Map a Binance stream key (e.g. "btcusdt_5m") to the Polymarket `Underlying`.

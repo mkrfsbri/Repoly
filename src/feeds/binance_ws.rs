@@ -308,7 +308,9 @@ mod tests {
     #[test]
     fn test_stream_key_parse() {
         assert_eq!(stream_key_from_stream("btcusdt@kline_5m"), "BTCUSDT_5m");
-        assert_eq!(stream_key_from_stream("ethusdt@kline_1m"), "ETHUSDT_1m");
+        assert_eq!(stream_key_from_stream("btcusdt@kline_15m"), "BTCUSDT_15m");
+        assert_eq!(stream_key_from_stream("ethusdt@kline_5m"), "ETHUSDT_5m");
+        assert_eq!(stream_key_from_stream("ethusdt@kline_15m"), "ETHUSDT_15m");
     }
 
     #[test]
