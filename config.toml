@@ -44,8 +44,8 @@ max_api_error_rate = 0.20
 cooldown_minutes = 60
 
 [volatility]
-atr_min_pct = 0.15          # lower bound of optimal range
-atr_max_pct = 0.80          # upper bound of optimal range
+atr_min_pct = 0.10          # lower bound: ~$67 range on BTC 5m bar; 0.15 was too aggressive
+atr_max_pct = 0.80          # upper bound: above 0.8% ATR is chaotic, skip
 
 [signal]
 confluence_threshold = 3.5  # out of max 7.0

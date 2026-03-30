@@ -102,12 +102,28 @@ impl StochState {
         self.initialized && self.prev_k > self.prev_d && self.k < self.d && self.prev_k > 80.0
     }
 
-    /// Score: +1.5 (long trigger), -1.5 (short trigger), 0 otherwise.
+    /// Graduated score based on zone and direction — fires across multiple bars,
+    /// not only on the single crossover event.
+    ///
+    /// +1.5  extreme oversold (<30) with %K turning up  OR  long trigger crossover
+    /// -1.5  extreme overbought (>70) with %K turning down OR short trigger crossover
+    /// +0.5  %K > %D, no extreme zone (general bullish momentum)
+    /// -0.5  %K < %D, no extreme zone (general bearish momentum)
+    ///  0.0  initialising or flat
     pub fn score(&self) -> f64 {
-        if self.is_long_trigger() {
+        if !self.initialized {
+            return 0.0;
+        }
+        // Strong: crossover from extreme zone OR already in extreme zone with direction
+        if self.is_long_trigger() || (self.k < 30.0 && self.k > self.d) {
             1.5
-        } else if self.is_short_trigger() {
+        } else if self.is_short_trigger() || (self.k > 70.0 && self.k < self.d) {
             -1.5
+        // Moderate: directional but not in extreme zone
+        } else if self.k > self.d {
+            0.5
+        } else if self.k < self.d {
+            -0.5
         } else {
             0.0
         }

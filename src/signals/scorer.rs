@@ -141,8 +141,16 @@ impl ConfluenceScore {
 
 /// Check that RSI, MACD, and Stochastic all agree on the same direction.
 ///
-/// This is a mandatory pre-condition: even if the total confluence score is high,
-/// if the core trio disagrees the signal is unreliable and must be blocked.
+/// This is a MANDATORY pre-condition for any entry — even a high total score is
+/// blocked if the core trio disagrees.
+///
+/// Uses STATE-BASED checks (not one-bar events) so the gate is satisfied across
+/// multiple bars of a developing move, not just the single crossover bar.
+///
+/// Long  — RSI oversold (<40) + MACD any bullish state + Stoch %K above %D and
+///          below the midline (was oversold, now recovering)
+/// Short — RSI overbought (>60) + MACD any bearish state + Stoch %K below %D and
+///          above the midline (was overbought, now rolling over)
 pub fn core_trio_aligned(
     rsi: &RsiState,
     macd: &MacdSignal,
@@ -151,14 +159,16 @@ pub fn core_trio_aligned(
 ) -> bool {
     match direction {
         Direction::Long => {
-            rsi.is_oversold()
-                && *macd == MacdSignal::BullishCross
-                && stoch.is_long_trigger()
+            rsi.is_oversold()   // RSI < 40
+                && macd.is_bullish() // histogram positive, any degree
+                && (stoch.is_long_trigger()
+                    || (stoch.initialized && stoch.k > stoch.d && stoch.k < 50.0))
         }
         Direction::Short => {
-            rsi.is_overbought()
-                && *macd == MacdSignal::BearishCross
-                && stoch.is_short_trigger()
+            rsi.is_overbought()  // RSI > 60
+                && macd.is_bearish() // histogram negative, any degree
+                && (stoch.is_short_trigger()
+                    || (stoch.initialized && stoch.k < stoch.d && stoch.k > 50.0))
         }
     }
 }

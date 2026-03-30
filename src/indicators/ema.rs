@@ -78,19 +78,23 @@ impl EmaStack {
         self.fast.initialized && self.slow.initialized && self.filter.initialized
     }
 
-    /// Returns a score: +0.5 (bullish structure), −0.5 (bearish), or 0.0 (choppy).
+    /// Graduated structure score using full EMA stack alignment.
+    ///
+    /// +0.5  fast > slow > filter (clean bull structure)
+    /// -0.5  fast < slow < filter (clean bear structure)
+    /// +0.25 mixed EMAs but price above filter (soft bull bias)
+    /// -0.25 mixed EMAs but price below filter (soft bear bias)
+    ///  0.0  not yet initialized
     pub fn structure_score(&self, price: f64) -> f64 {
         if !self.is_initialized() {
             return 0.0;
         }
-        if self.is_choppy() {
-            return 0.0;
+        let dir = self.direction(); // +1.0 bull, -1.0 bear, 0.0 choppy/mixed
+        if dir != 0.0 {
+            return dir * 0.5;
         }
-        if price > self.filter.value {
-            0.5
-        } else {
-            -0.5
-        }
+        // Mixed alignment: softer signal from price position relative to filter EMA
+        if price > self.filter.value { 0.25 } else { -0.25 }
     }
 
     /// True when fast > slow > filter and spread is meaningful.

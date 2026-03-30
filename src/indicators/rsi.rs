@@ -80,11 +80,14 @@ impl RsiState {
         }
     }
 
-    /// Score: +1 (oversold, bullish context), -1 (overbought, bearish), 0 (neutral).
+    /// Score: +1 (RSI < 40, oversold context), -1 (RSI > 60, overbought), 0 (neutral).
+    ///
+    /// Thresholds are symmetric around 50 and match `is_oversold` / `is_overbought`
+    /// exactly so the core-trio check and the score always agree on direction.
     pub fn score(&self) -> f64 {
         match self.get() {
             Some(v) if v < 40.0 => 1.0,
-            Some(v) if v > 70.0 => -1.0,
+            Some(v) if v > 60.0 => -1.0,
             Some(_) => 0.0,
             None => 0.0,
         }
@@ -94,6 +97,7 @@ impl RsiState {
         self.get().map(|v| v < 40.0).unwrap_or(false)
     }
 
+    /// RSI > 60 — symmetric counterpart to `is_oversold` (< 40).
     pub fn is_overbought(&self) -> bool {
         self.get().map(|v| v > 60.0).unwrap_or(false)
     }
