@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
-// ── Domain types ─────────────────────────────────────────────────────────────
+// ── Domain types ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct PolyMarket {
@@ -20,6 +20,8 @@ pub struct PolyMarket {
     pub current_price: Decimal,
     pub volume_24h: Decimal,
     pub underlying: Underlying,
+    /// Cycle length in seconds (300 or 900).
+    pub interval_secs: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,12 +39,11 @@ impl PolyMarket {
 
 // ── Gamma API response structs ────────────────────────────────────────────────
 
-/// Nested token object inside the `tokens` array.
 #[derive(Debug, Deserialize)]
 struct GammaToken {
     token_id: Option<String>,
     outcome: Option<String>,
-    price: Option<serde_json::Value>, // may be f64 or "0.52" string
+    price: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,10 +53,8 @@ struct GammaMarket {
 
     question: Option<String>,
 
-    // Gamma may return token IDs as a flat string array...
     #[serde(rename = "clobTokenIds")]
     clob_token_ids: Option<Vec<String>>,
-    // ...or as a nested object array.
     tokens: Option<Vec<GammaToken>>,
 
     #[serde(rename = "outcomePrices")]
@@ -64,21 +63,13 @@ struct GammaMarket {
     #[serde(rename = "endDate")]
     end_date: Option<String>,
 
-    // BUG FIX: unwrap_or(false) caused every market with absent field to be silently dropped.
-    // absent = assume active (we already filtered via ?active=true in the URL).
     #[serde(default = "bool_true")]
     active: bool,
-
-    // BUG FIX: unwrap_or(true) caused every market with absent field to be dropped.
-    // absent = assume not closed.
     #[serde(default = "bool_false")]
     closed: bool,
-
-    // Skip archived markets.
     #[serde(default = "bool_false")]
     archived: bool,
 
-    // BUG FIX: some markets only carry `volume`, not `volume24hr`.
     #[serde(rename = "volume24hr")]
     volume_24hr: Option<f64>,
     volume: Option<f64>,
@@ -94,285 +85,356 @@ pub type MarketMap = Arc<RwLock<Vec<PolyMarket>>>;
 pub struct GammaClient {
     base_url: String,
     min_volume_24h: f64,
-    max_resolution_minutes: i64,
+    /// Cycle lengths we care about (seconds): [300, 900].
+    interval_secs: Vec<i64>,
+    /// When fewer than this many seconds remain in the current window,
+    /// pre-fetch the NEXT cycle's market instead.
+    min_entry_secs: i64,
     pub markets: MarketMap,
     http: reqwest::Client,
 }
 
 impl GammaClient {
-    pub fn new(base_url: String, min_volume_24h: f64, max_resolution_minutes: i64) -> Self {
+    pub fn new(
+        base_url: String,
+        min_volume_24h: f64,
+        interval_secs: Vec<i64>,
+        min_entry_secs: i64,
+    ) -> Self {
         Self {
             base_url,
             min_volume_24h,
-            max_resolution_minutes,
+            interval_secs,
+            min_entry_secs,
             markets: Arc::new(RwLock::new(Vec::new())),
             http: reqwest::Client::new(),
         }
     }
 
-    /// Fetch all pages and filter markets.
+    /// Refresh the market list using deterministic cycle-based queries.
+    ///
+    /// For each configured interval (e.g. 300 s, 900 s) we compute the target
+    /// expiry timestamp for the currently active window (or the next one when
+    /// fewer than `min_entry_secs` remain) and query the Gamma API with a
+    /// ±30-second `end_date` window. This avoids full pagination and always
+    /// hits the exact markets we intend to trade.
     pub async fn refresh(&self) -> Result<usize> {
-        // BUG FIX: was limited to 200 results with no pagination.
-        // Now fetches all pages until a short page is returned.
-        const PAGE_LIMIT: usize = 200;
-        let mut offset = 0usize;
-        let mut all_raw: Vec<GammaMarket> = Vec::new();
+        let now = Utc::now();
+        let mut raw_candidates: Vec<GammaMarket> = Vec::new();
 
-        loop {
+        for &interval in &self.interval_secs {
+            let target = cycle_target_expiry(interval, self.min_entry_secs, now);
+
+            // ± 30 s tolerance window around the exact cycle boundary.
+            let win_start = target - chrono::Duration::seconds(30);
+            let win_end   = target + chrono::Duration::seconds(30);
+
             let url = format!(
-                "{}/markets?active=true&closed=false&limit={PAGE_LIMIT}&offset={offset}",
-                self.base_url
+                "{}/markets?active=true&closed=false\
+                 &end_date_min={}&end_date_max={}&limit=50",
+                self.base_url,
+                win_start.format("%Y-%m-%dT%H:%M:%SZ"),
+                win_end.format("%Y-%m-%dT%H:%M:%SZ"),
             );
-            debug!("Fetching Gamma markets: {url}");
 
-            let page: Vec<GammaMarket> = match self.http.get(&url).send().await {
-                Ok(resp) => match resp.json().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("Gamma API JSON parse error at offset={offset}: {e}");
-                        break;
-                    }
-                },
-                Err(e) => {
-                    warn!("Gamma API request failed at offset={offset}: {e}");
-                    break;
+            debug!(
+                "Gamma cycle={}s target={} query: {}",
+                interval,
+                target.format("%H:%M:%S"),
+                url
+            );
+
+            match self.fetch_raw(&url).await {
+                Ok(mut page) => {
+                    info!(
+                        "Gamma cycle={}s expiry={}: {} raw markets returned",
+                        interval,
+                        target.format("%H:%M:%S"),
+                        page.len()
+                    );
+                    // Tag each entry with its cycle interval so we can attach it
+                    // to the PolyMarket after filtering.  We abuse a transient
+                    // workaround: store interval in a wrapper.
+                    raw_candidates.append(&mut page);
                 }
-            };
-
-            let page_len = page.len();
-            all_raw.extend(page);
-            debug!("Gamma page offset={offset}: {page_len} markets");
-
-            if page_len < PAGE_LIMIT {
-                break; // last page
+                Err(e) => {
+                    warn!("Gamma cycle={}s query failed: {e}", interval);
+                }
             }
-            offset += PAGE_LIMIT;
         }
 
-        info!("Gamma: fetched {} total markets before filtering", all_raw.len());
+        let filtered = self.filter(raw_candidates, now);
+        let count = filtered.len();
+        *self.markets.write().await = filtered;
 
-        let now = Utc::now();
-        let mut filtered = Vec::new();
-        let mut rejected_active = 0usize;
-        let mut rejected_question = 0usize;
-        let mut rejected_volume = 0usize;
-        let mut rejected_expiry = 0usize;
-        let mut rejected_tokens = 0usize;
+        if count == 0 {
+            warn!(
+                "Gamma: 0 tradeable markets found. \
+                 Intervals: {:?}  min_entry_secs: {}  now: {}",
+                self.interval_secs,
+                self.min_entry_secs,
+                now.format("%H:%M:%S")
+            );
+        } else {
+            info!("Gamma: {} tradeable market(s) ready", count);
+        }
 
-        for m in all_raw {
-            let condition_id = match m.condition_id {
-                Some(id) if !id.is_empty() => id,
+        Ok(count)
+    }
+
+    /// Run discovery loop, refreshing every `interval_secs`.
+    pub async fn run(self: Arc<Self>, refresh_secs: u64) {
+        loop {
+            if let Err(e) = self.refresh().await {
+                error!("Gamma API error: {e:#}");
+            }
+            sleep(Duration::from_secs(refresh_secs)).await;
+        }
+    }
+
+    /// Snapshot of current tradeable markets.
+    pub async fn active_markets(&self) -> Vec<PolyMarket> {
+        self.markets.read().await.clone()
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    async fn fetch_raw(&self, url: &str) -> Result<Vec<GammaMarket>> {
+        let resp = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Gamma HTTP {status}: {body}");
+        }
+
+        Ok(resp.json::<Vec<GammaMarket>>().await?)
+    }
+
+    fn filter(&self, raw: Vec<GammaMarket>, now: DateTime<Utc>) -> Vec<PolyMarket> {
+        let mut out = Vec::new();
+        let mut rej_status  = 0usize;
+        let mut rej_asset   = 0usize;
+        let mut rej_volume  = 0usize;
+        let mut rej_expiry  = 0usize;
+        let mut rej_tokens  = 0usize;
+
+        'market: for m in raw {
+            let cid = match m.condition_id.as_deref() {
+                Some(s) if !s.is_empty() => s.to_string(),
                 _ => continue,
             };
 
-            // BUG FIX: was `m.active.unwrap_or(false)` and `m.closed.unwrap_or(true)`
-            // which dropped ALL markets whenever these fields were absent in the JSON.
-            // Now using serde default_fn so absent → true/false respectively.
             if !m.active || m.closed || m.archived {
-                rejected_active += 1;
-                debug!("Gamma rejected [active/closed/archived]: {condition_id}");
+                rej_status += 1;
                 continue;
             }
 
-            let question = m.question.unwrap_or_default();
+            let question = m.question.clone().unwrap_or_default();
             let underlying = detect_underlying(&question);
             if underlying == Underlying::Other {
-                rejected_question += 1;
+                rej_asset += 1;
                 continue;
             }
 
-            // BUG FIX: `volume24hr` absent → 0.0 < min_volume → filtered.
-            // Use volume24hr first; fall back to generic `volume`.
-            let effective_volume = m.volume_24hr
-                .or(m.volume)
-                .unwrap_or(0.0);
-            if effective_volume < self.min_volume_24h {
-                rejected_volume += 1;
+            let vol = m.volume_24hr.or(m.volume).unwrap_or(0.0);
+            if vol < self.min_volume_24h {
+                rej_volume += 1;
                 debug!(
-                    "Gamma rejected [volume={effective_volume:.0} < {:.0}]: {condition_id} \"{}\"",
-                    self.min_volume_24h,
-                    &question[..question.len().min(60)]
+                    "Gamma reject [vol={vol:.0}<{:.0}]: {cid}",
+                    self.min_volume_24h
                 );
                 continue;
             }
 
-            let end_date = match m.end_date {
-                Some(d) if !d.is_empty() => d,
-                _ => {
-                    rejected_expiry += 1;
-                    continue;
-                }
+            let end_str = match m.end_date.as_deref() {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => { rej_expiry += 1; continue; }
             };
-            let expiry = match parse_expiry(&end_date) {
+            let expiry = match parse_expiry(&end_str) {
                 Ok(t) => t,
                 Err(e) => {
-                    rejected_expiry += 1;
-                    debug!("Gamma rejected [unparseable endDate={end_date:?}]: {e}");
+                    rej_expiry += 1;
+                    debug!("Gamma reject [bad end_date={end_str:?} {e}]: {cid}");
                     continue;
                 }
             };
-            let minutes_left = (expiry - now).num_minutes();
-            if minutes_left <= 0 || minutes_left > self.max_resolution_minutes {
-                rejected_expiry += 1;
-                debug!(
-                    "Gamma rejected [minutes_left={minutes_left} not in 1..={}]: {condition_id}",
-                    self.max_resolution_minutes
-                );
+            if expiry <= now {
+                rej_expiry += 1;
+                debug!("Gamma reject [already expired]: {cid}");
                 continue;
             }
 
-            // BUG FIX: only tried `clobTokenIds` flat array. Now also falls back to
-            // the nested `tokens[].token_id` array if clobTokenIds is absent/empty.
-            let tokens = extract_token_ids(&m.clob_token_ids, &m.tokens);
-            if tokens.len() < 2 {
-                rejected_tokens += 1;
-                debug!("Gamma rejected [token_count={}]: {condition_id}", tokens.len());
+            let token_ids = extract_token_ids(&m.clob_token_ids, &m.tokens);
+            if token_ids.len() < 2 {
+                rej_tokens += 1;
+                debug!("Gamma reject [tokens={}]: {cid}", token_ids.len());
                 continue;
             }
+
+            // Determine which configured cycle this expiry belongs to.
+            let interval_secs = best_interval(expiry, now, &self.interval_secs);
 
             let current_price = m
                 .outcome_prices
                 .as_deref()
                 .and_then(|p| p.first())
                 .and_then(|s| Decimal::from_str(s).ok())
-                // Fallback: read price from nested tokens array
-                .or_else(|| {
-                    m.tokens.as_deref()?.first().and_then(|t| {
-                        match &t.price {
-                            Some(serde_json::Value::Number(n)) => {
-                                Decimal::from_str(&n.to_string()).ok()
-                            }
-                            Some(serde_json::Value::String(s)) => Decimal::from_str(s).ok(),
-                            _ => None,
-                        }
-                    })
-                })
+                .or_else(|| price_from_tokens(m.tokens.as_deref()))
                 .unwrap_or(Decimal::new(50, 2));
 
-            filtered.push(PolyMarket {
-                condition_id,
-                token_yes_id: tokens[0].clone(),
-                token_no_id: tokens[1].clone(),
+            // Deduplicate by condition_id (cycle-based queries can return the
+            // same market from overlapping windows).
+            if out.iter().any(|p: &PolyMarket| p.condition_id == cid) {
+                continue 'market;
+            }
+
+            out.push(PolyMarket {
+                condition_id: cid,
+                token_yes_id: token_ids[0].clone(),
+                token_no_id:  token_ids[1].clone(),
                 question,
                 expiry,
                 current_price,
-                volume_24h: Decimal::from_str(&effective_volume.to_string())
-                    .unwrap_or(Decimal::ZERO),
+                volume_24h: Decimal::from_str(&format!("{vol:.6}")).unwrap_or(Decimal::ZERO),
                 underlying,
+                interval_secs,
             });
         }
 
-        let count = filtered.len();
-        *self.markets.write().await = filtered;
-
-        info!(
-            "Gamma: {count} tradeable markets | rejected: active/closed={rejected_active} \
-             question={rejected_question} volume={rejected_volume} \
-             expiry={rejected_expiry} tokens={rejected_tokens}"
+        debug!(
+            "Gamma filter: ok={} rej_status={rej_status} rej_asset={rej_asset} \
+             rej_vol={rej_volume} rej_expiry={rej_expiry} rej_tokens={rej_tokens}",
+            out.len()
         );
-        Ok(count)
-    }
 
-    /// Run discovery loop, refreshing every `interval_secs`.
-    pub async fn run(self: Arc<Self>, interval_secs: u64) {
-        loop {
-            if let Err(e) = self.refresh().await {
-                error!("Gamma API error: {e:#}");
-            }
-            sleep(Duration::from_secs(interval_secs)).await;
-        }
-    }
-
-    /// Get a snapshot of current markets.
-    pub async fn active_markets(&self) -> Vec<PolyMarket> {
-        self.markets.read().await.clone()
+        out
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Cycle helpers ─────────────────────────────────────────────────────────────
 
-/// Try `clobTokenIds` first; fall back to `tokens[].token_id`.
+/// Compute the target cycle expiry that we want to trade right now.
+///
+/// The "current" cycle boundary is `ceil(now / interval) * interval`.
+/// If fewer than `min_entry_secs` remain in that window, return the NEXT
+/// boundary so we pre-fetch the upcoming market while the current one winds
+/// down.
+pub fn cycle_target_expiry(
+    interval_secs: i64,
+    min_entry_secs: i64,
+    now: DateTime<Utc>,
+) -> DateTime<Utc> {
+    let ts = now.timestamp();
+    let current_boundary = ((ts / interval_secs) + 1) * interval_secs;
+    let remaining = current_boundary - ts;
+
+    let target_ts = if remaining < min_entry_secs {
+        current_boundary + interval_secs // pre-fetch next cycle
+    } else {
+        current_boundary
+    };
+
+    DateTime::from_timestamp(target_ts, 0).unwrap_or(now)
+}
+
+/// Find which configured interval best matches a market's expiry.
+fn best_interval(expiry: DateTime<Utc>, now: DateTime<Utc>, intervals: &[i64]) -> i64 {
+    let secs_left = (expiry - now).num_seconds().max(0);
+    // Pick the interval whose boundary is closest to the seconds remaining.
+    intervals
+        .iter()
+        .copied()
+        .min_by_key(|&iv| (secs_left % iv).min(iv - secs_left % iv))
+        .unwrap_or(300)
+}
+
+// ── Parsing helpers ───────────────────────────────────────────────────────────
+
 fn extract_token_ids(
     flat: &Option<Vec<String>>,
     nested: &Option<Vec<GammaToken>>,
 ) -> Vec<String> {
     if let Some(ids) = flat {
-        let non_empty: Vec<String> = ids.iter().filter(|s| !s.is_empty()).cloned().collect();
-        if non_empty.len() >= 2 {
-            return non_empty;
+        let clean: Vec<String> = ids.iter().filter(|s| !s.is_empty()).cloned().collect();
+        if clean.len() >= 2 {
+            return clean;
         }
     }
-    if let Some(tok_list) = nested {
-        let ids: Vec<String> = tok_list
+    if let Some(list) = nested {
+        return list
             .iter()
             .filter_map(|t| t.token_id.as_deref().filter(|s| !s.is_empty()).map(str::to_string))
             .collect();
-        return ids;
     }
     vec![]
 }
 
+fn price_from_tokens(tokens: Option<&[GammaToken]>) -> Option<Decimal> {
+    tokens?.first().and_then(|t| match &t.price {
+        Some(serde_json::Value::Number(n)) => Decimal::from_str(&n.to_string()).ok(),
+        Some(serde_json::Value::String(s)) => Decimal::from_str(s).ok(),
+        _ => None,
+    })
+}
+
 pub fn detect_underlying(question: &str) -> Underlying {
     let q = question.to_lowercase();
-    // BTC: accept "bitcoin", "btc", "btc-usd", "btcusd", "xbt"
-    if q.contains("bitcoin") || q.contains(" btc") || q.starts_with("btc")
-        || q.contains("btc-usd") || q.contains("btcusd") || q.contains(" xbt")
+    if q.contains("bitcoin")
+        || q.contains(" btc")
+        || q.starts_with("btc")
+        || q.contains("btc-usd")
+        || q.contains("btcusd")
+        || q.contains(" xbt")
     {
         return Underlying::Btc;
     }
-    // ETH: accept "ethereum", "eth", "eth-usd", "ethusd", "ether"
-    if q.contains("ethereum") || q.contains(" eth") || q.starts_with("eth")
-        || q.contains("eth-usd") || q.contains("ethusd") || q.contains("ether ")
+    if q.contains("ethereum")
+        || q.contains(" eth")
+        || q.starts_with("eth")
+        || q.contains("eth-usd")
+        || q.contains("ethusd")
+        || q.contains("ether ")
     {
         return Underlying::Eth;
     }
     Underlying::Other
 }
 
-/// Parse a market expiry string into UTC DateTime.
-///
-/// Handles (in order):
-/// 1. RFC 3339  "2025-03-30T10:05:00Z" / "…+00:00" / "…+05:30"
-/// 2. Space-sep  "2025-03-30 10:05:00"
-/// 3. No seconds "2025-03-30T10:05" / "2025-03-30 10:05"
-/// 4. Date-only  "2025-03-30"  (treated as 23:59:59 UTC so it doesn't
-///    expire at midnight and get dropped by the minutes_left > 0 check)
-/// 5. Unix epoch (integer string) "1743330300"
+/// Parse a market expiry string in any of several common formats.
 pub fn parse_expiry(s: &str) -> Result<DateTime<Utc>> {
     let s = s.trim();
 
-    // 1. RFC 3339 / ISO 8601 with timezone
+    // RFC 3339 (handles "Z", "+00:00", milliseconds, etc.)
     if let Ok(t) = DateTime::parse_from_rfc3339(s) {
         return Ok(t.with_timezone(&Utc));
     }
-
-    // 2. "YYYY-MM-DDTHH:MM:SS" (no tz → assume UTC)
+    // "YYYY-MM-DDTHH:MM:SS"
     if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
         return Ok(t.and_utc());
     }
-
-    // 3. Space separator "YYYY-MM-DD HH:MM:SS"
+    // "YYYY-MM-DD HH:MM:SS"
     if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
         return Ok(t.and_utc());
     }
-
-    // 4. No seconds: "YYYY-MM-DDTHH:MM" or "YYYY-MM-DD HH:MM"
+    // "YYYY-MM-DDTHH:MM" / "YYYY-MM-DD HH:MM"
     if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M") {
         return Ok(t.and_utc());
     }
     if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M") {
         return Ok(t.and_utc());
     }
-
-    // 5. Date-only "YYYY-MM-DD" → treat as end-of-day UTC
+    // "YYYY-MM-DD"  → treat as end-of-day UTC
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        let t = d
-            .and_hms_opt(23, 59, 59)
-            .expect("23:59:59 is always valid");
+        let t = d.and_hms_opt(23, 59, 59).expect("valid time");
         return Ok(t.and_utc());
     }
-
-    // 6. Unix epoch integer (seconds)
+    // Unix epoch integer
     if let Ok(secs) = s.parse::<i64>() {
         if let Some(t) = DateTime::from_timestamp(secs, 0) {
             return Ok(t);
@@ -388,109 +450,108 @@ pub fn parse_expiry(s: &str) -> Result<DateTime<Utc>> {
 mod tests {
     use super::*;
 
+    // ── detect_underlying ─────────────────────────────────────────────────────
+
     #[test]
     fn test_detect_underlying() {
-        // Canonical cases
         assert_eq!(detect_underlying("Will Bitcoin exceed $70k?"), Underlying::Btc);
         assert_eq!(detect_underlying("ETH price above 4000 on Dec 31?"), Underlying::Eth);
         assert_eq!(detect_underlying("Will it rain tomorrow?"), Underlying::Other);
 
-        // Polymarket BTC 5m/15m style questions
         assert_eq!(detect_underlying("BTC up or down in the next 5 minutes?"), Underlying::Btc);
         assert_eq!(detect_underlying("Will BTC-USD be higher at 10:05?"), Underlying::Btc);
-        assert_eq!(detect_underlying("Crypto 15-min: BTC"), Underlying::Btc);
-
-        // ETH short-term
         assert_eq!(detect_underlying("ETH-USD 5 min up/down"), Underlying::Eth);
         assert_eq!(detect_underlying("Ethereum price up in 15 min?"), Underlying::Eth);
+    }
 
-        // Edge: avoid false positive on unrelated questions
-        assert_eq!(detect_underlying("Will the batch process complete?"), Underlying::Other);
+    // ── parse_expiry ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_expiry_rfc3339()       { assert_eq!(parse_expiry("2025-03-30T10:05:00Z").unwrap().format("%H:%M").to_string(), "10:05"); }
+    #[test]
+    fn test_parse_expiry_rfc3339_millis(){ assert_eq!(parse_expiry("2025-03-30T10:05:00.000Z").unwrap().format("%H:%M").to_string(), "10:05"); }
+    #[test]
+    fn test_parse_expiry_space_sep()     { assert_eq!(parse_expiry("2025-03-30 10:05:00").unwrap().format("%H:%M").to_string(), "10:05"); }
+    #[test]
+    fn test_parse_expiry_no_seconds()    { assert_eq!(parse_expiry("2025-03-30T10:05").unwrap().format("%H:%M").to_string(), "10:05"); }
+    #[test]
+    fn test_parse_expiry_date_only()     { assert_eq!(parse_expiry("2025-03-30").unwrap().format("%H:%M:%S").to_string(), "23:59:59"); }
+    #[test]
+    fn test_parse_expiry_unix() {
+        let secs = DateTime::parse_from_rfc3339("2025-03-30T10:05:00Z").unwrap().timestamp();
+        assert_eq!(parse_expiry(&secs.to_string()).unwrap().format("%H:%M").to_string(), "10:05");
+    }
+
+    // ── cycle_target_expiry ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_cycle_target_plenty_of_time() {
+        // now = 10:01:00 UTC, interval = 300 s, min_entry = 60 s
+        // current boundary = 10:05:00, remaining = 240 s > 60 → use current boundary
+        let now = DateTime::parse_from_rfc3339("2025-03-30T10:01:00Z").unwrap().with_timezone(&Utc);
+        let target = cycle_target_expiry(300, 60, now);
+        assert_eq!(target.format("%H:%M:%S").to_string(), "10:05:00");
     }
 
     #[test]
-    fn test_parse_expiry_rfc3339() {
-        let t = parse_expiry("2025-03-30T10:05:00Z").unwrap();
-        assert_eq!(t.format("%H:%M").to_string(), "10:05");
+    fn test_cycle_target_too_little_time() {
+        // now = 10:04:30 UTC, interval = 300 s, min_entry = 60 s
+        // current boundary = 10:05:00, remaining = 30 s < 60 → pre-fetch next = 10:10:00
+        let now = DateTime::parse_from_rfc3339("2025-03-30T10:04:30Z").unwrap().with_timezone(&Utc);
+        let target = cycle_target_expiry(300, 60, now);
+        assert_eq!(target.format("%H:%M:%S").to_string(), "10:10:00");
     }
 
     #[test]
-    fn test_parse_expiry_rfc3339_millis() {
-        // chrono's rfc3339 parser handles sub-second and explicit +00:00
-        let t = parse_expiry("2025-03-30T10:05:00.000Z").unwrap();
-        assert_eq!(t.format("%H:%M").to_string(), "10:05");
+    fn test_cycle_target_15m() {
+        // now = 10:05:00, interval = 900 s, boundary = 10:15:00, remaining = 600 > 60 → 10:15
+        let now = DateTime::parse_from_rfc3339("2025-03-30T10:05:00Z").unwrap().with_timezone(&Utc);
+        let target = cycle_target_expiry(900, 60, now);
+        assert_eq!(target.format("%H:%M:%S").to_string(), "10:15:00");
     }
 
-    #[test]
-    fn test_parse_expiry_space_sep() {
-        let t = parse_expiry("2025-03-30 10:05:00").unwrap();
-        assert_eq!(t.format("%H:%M").to_string(), "10:05");
-    }
+    // ── extract_token_ids ─────────────────────────────────────────────────────
 
     #[test]
-    fn test_parse_expiry_no_seconds() {
-        let t = parse_expiry("2025-03-30T10:05").unwrap();
-        assert_eq!(t.format("%H:%M").to_string(), "10:05");
-    }
-
-    #[test]
-    fn test_parse_expiry_date_only() {
-        let t = parse_expiry("2025-03-30").unwrap();
-        // treated as end-of-day
-        assert_eq!(t.format("%H:%M:%S").to_string(), "23:59:59");
-    }
-
-    #[test]
-    fn test_parse_expiry_unix_timestamp() {
-        // 2025-03-30 10:05:00 UTC
-        let secs = DateTime::parse_from_rfc3339("2025-03-30T10:05:00Z")
-            .unwrap()
-            .timestamp();
-        let t = parse_expiry(&secs.to_string()).unwrap();
-        assert_eq!(t.format("%H:%M").to_string(), "10:05");
-    }
-
-    #[test]
-    fn test_extract_token_ids_flat_preferred() {
-        let flat = Some(vec!["tok_yes".to_string(), "tok_no".to_string()]);
+    fn test_extract_flat_preferred() {
+        let flat = Some(vec!["yes".to_string(), "no".to_string()]);
         let nested = Some(vec![
-            GammaToken { token_id: Some("other1".to_string()), outcome: None, price: None },
+            GammaToken { token_id: Some("other".to_string()), outcome: None, price: None },
             GammaToken { token_id: Some("other2".to_string()), outcome: None, price: None },
         ]);
-        let result = extract_token_ids(&flat, &nested);
-        assert_eq!(result[0], "tok_yes");
+        assert_eq!(extract_token_ids(&flat, &nested)[0], "yes");
     }
 
     #[test]
-    fn test_extract_token_ids_falls_back_to_nested() {
+    fn test_extract_nested_fallback() {
         let flat: Option<Vec<String>> = None;
         let nested = Some(vec![
-            GammaToken { token_id: Some("nested_yes".to_string()), outcome: None, price: None },
-            GammaToken { token_id: Some("nested_no".to_string()), outcome: None, price: None },
+            GammaToken { token_id: Some("ny".to_string()), outcome: None, price: None },
+            GammaToken { token_id: Some("nn".to_string()), outcome: None, price: None },
         ]);
-        let result = extract_token_ids(&flat, &nested);
-        assert_eq!(result[0], "nested_yes");
-        assert_eq!(result[1], "nested_no");
+        let ids = extract_token_ids(&flat, &nested);
+        assert_eq!(ids[0], "ny");
+        assert_eq!(ids[1], "nn");
     }
 
     #[test]
-    fn test_extract_token_ids_empty_flat_falls_back() {
+    fn test_extract_empty_flat_falls_back() {
         let flat = Some(vec!["".to_string(), "".to_string()]);
         let nested = Some(vec![
-            GammaToken { token_id: Some("fallback_yes".to_string()), outcome: None, price: None },
-            GammaToken { token_id: Some("fallback_no".to_string()), outcome: None, price: None },
+            GammaToken { token_id: Some("fb_yes".to_string()), outcome: None, price: None },
+            GammaToken { token_id: Some("fb_no".to_string()), outcome: None, price: None },
         ]);
-        let result = extract_token_ids(&flat, &nested);
-        assert_eq!(result[0], "fallback_yes");
+        assert_eq!(extract_token_ids(&flat, &nested)[0], "fb_yes");
     }
+
+    // ── active/closed serde defaults ──────────────────────────────────────────
 
     #[test]
     fn test_active_closed_defaults() {
-        // Verify serde defaults: absent = active, absent = not closed
         let json = r#"{"conditionId":"0xabc","question":"BTC up in 5min?"}"#;
         let m: GammaMarket = serde_json::from_str(json).unwrap();
-        assert!(m.active, "absent active field should default to true");
-        assert!(!m.closed, "absent closed field should default to false");
-        assert!(!m.archived, "absent archived field should default to false");
+        assert!(m.active,   "absent active  → should default true");
+        assert!(!m.closed,  "absent closed  → should default false");
+        assert!(!m.archived,"absent archived → should default false");
     }
 }

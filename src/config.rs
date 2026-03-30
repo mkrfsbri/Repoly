@@ -45,7 +45,11 @@ pub struct GammaConfig {
     pub base_url: String,
     pub refresh_interval_secs: u64,
     pub min_volume_24h: f64,
-    pub max_resolution_minutes: i64,
+    /// Cycle lengths in seconds (e.g. [300, 900] for 5-min and 15-min markets).
+    pub interval_secs: Vec<i64>,
+    /// Skip the current cycle and pre-fetch the next one when fewer than this
+    /// many seconds remain in the current market window.
+    pub min_entry_secs: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

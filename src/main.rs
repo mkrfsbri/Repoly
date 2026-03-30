@@ -67,7 +67,8 @@ async fn main() -> Result<()> {
     let gamma = Arc::new(GammaClient::new(
         cfg.gamma.base_url.clone(),
         cfg.gamma.min_volume_24h,
-        cfg.gamma.max_resolution_minutes,
+        cfg.gamma.interval_secs.clone(),
+        cfg.gamma.min_entry_secs,
     ));
     {
         let g = gamma.clone();
